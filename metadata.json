@@ -1,0 +1,7 @@
+{
+  "name": "EchoScript",
+  "description": "A smart audio transcription tool using Gemini 3 Flash to provide accurate speech-to-text with speaker diarization, timestamps, and language detection.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
