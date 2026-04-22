@@ -11,7 +11,7 @@
   "dependencies": {
     "@ffmpeg/ffmpeg": "^0.12.15",
     "@ffmpeg/util": "^0.12.2",
-    "next": "16.1.6",
+    "next": "^16.2.4",
     "react": "19.2.3",
     "react-dom": "19.2.3"
   },
@@ -20,9 +20,15 @@
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
-    "eslint": "^9",
-    "eslint-config-next": "16.1.6",
+    "eslint": "^9.39.4",
+    "eslint-config-next": "^16.2.4",
+    "eslint-import-resolver-typescript": "^4.4.4",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "typescript": "^5",
+    "typescript-eslint": "^8.59.0"
+  },
+  "overrides": {
+    "flatted": "3.4.2",
+    "tinyglobby": "0.2.16"
   }
 }

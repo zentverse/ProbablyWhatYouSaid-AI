@@ -52,6 +52,12 @@ Copy the sample environment file and fill in the provider credentials you want t
 copy .env.example .env
 ```
 
+Optional hardening knobs in `backend/.env`:
+
+- `MAX_UPLOAD_SIZE_MB=256` limits how much data one upload can send while still allowing long-form recordings to use the background queue.
+- `MAX_CONCURRENT_TRANSCRIPTIONS=2` caps simultaneous provider work.
+- `MAX_ACTIVE_BACKGROUND_JOBS=4` rejects new large uploads when the queue is already busy.
+
 Start the API:
 
 ```bash
@@ -95,6 +101,7 @@ Backend docs are available at `http://127.0.0.1:8100/docs`.
 ## Notes
 
 - Large transcription jobs can be queued and polled through `GET /transcribe/jobs/{job_id}`.
+- Uploads above `MAX_UPLOAD_SIZE_MB` are rejected before multipart parsing to reduce disk and CPU abuse.
 - Browser-side video conversion loads FFmpeg from jsDelivr on first use.
 - If frontend and backend run on different origins, update `CORS_ALLOWED_ORIGINS` in `backend/.env`.
 
