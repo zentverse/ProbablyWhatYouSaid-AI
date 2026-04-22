@@ -8,7 +8,7 @@ import threading
 import re
 from collections import Counter
 from uuid import uuid4
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
@@ -49,6 +49,19 @@ def log_debug(message: str) -> None:
     """Keep debug logging from crashing on Windows cp1252 consoles."""
     safe_message = message.encode("ascii", errors="backslashreplace").decode("ascii")
     print(safe_message)
+
+
+def _get_env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer.") from exc
+    if value < minimum:
+        raise RuntimeError(f"{name} must be at least {minimum}.")
+    return value
 
 
 def _safe_remove_file(path: str | None) -> None:
@@ -408,22 +421,55 @@ def _is_openai_language_drift(result: dict, lang: str) -> bool:
 async def _save_upload_to_temp(upload: UploadFile) -> tuple[str, int]:
     suffix = os.path.splitext(upload.filename or "")[1] or ".bin"
     size = 0
+    temp_path = None
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        while True:
-            chunk = await upload.read(1024 * 1024)
-            if not chunk:
-                break
-            tmp.write(chunk)
-            size += len(chunk)
-        temp_path = tmp.name
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            temp_path = tmp.name
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_UPLOAD_SIZE_BYTES:
+                    raise HTTPException(
+                        413,
+                        f"Upload too large. Limit is {MAX_UPLOAD_SIZE_MB} MB per file.",
+                    )
+                tmp.write(chunk)
+    except Exception:
+        _safe_remove_file(temp_path)
+        raise
+    finally:
+        await upload.close()
 
-    await upload.close()
     return temp_path, size
+
+
+def _count_active_background_jobs() -> int:
+    with JOB_STORE_LOCK:
+        return sum(
+            1
+            for job in TRANSCRIPTION_JOBS.values()
+            if job.get("status") in {"queued", "processing"}
+        )
+
+
+async def _run_transcription_with_slot(runner_factory):
+    async with TRANSCRIPTION_RUNNER_SLOTS:
+        return await runner_factory()
 
 
 def _enqueue_transcription_job(provider: str, temp_path: str, runner_factory):
     _prune_old_jobs()
+    if _count_active_background_jobs() >= MAX_ACTIVE_BACKGROUND_JOBS:
+        raise HTTPException(
+            429,
+            (
+                "The server is already processing the maximum number of background "
+                f"jobs ({MAX_ACTIVE_BACKGROUND_JOBS}). Try again shortly."
+            ),
+        )
     job_id = uuid4().hex
     with JOB_STORE_LOCK:
         TRANSCRIPTION_JOBS[job_id] = {
@@ -465,7 +511,7 @@ async def _run_transcription_job(job_id: str, provider: str, runner_factory):
         )
 
     try:
-        result = await runner_factory(on_progress)
+        result = await _run_transcription_with_slot(lambda: runner_factory(on_progress))
         total_chunks = TRANSCRIPTION_JOBS[job_id].get("total_chunks") or 0
         _set_job_state(
             job_id,
@@ -507,6 +553,53 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def enforce_upload_limits(request: Request, call_next):
+    if request.method == "POST" and request.url.path == "/transcribe":
+        content_type = request.headers.get("content-type", "")
+        if "multipart/form-data" not in content_type.lower():
+            return JSONResponse(
+                status_code=415,
+                content={"detail": "Upload requests must use multipart/form-data."},
+            )
+
+        content_length = request.headers.get("content-length")
+        if not content_length:
+            return JSONResponse(
+                status_code=411,
+                content={
+                    "detail": (
+                        "Content-Length is required for uploads and must stay within "
+                        f"the {MAX_UPLOAD_SIZE_MB} MB file limit."
+                    )
+                },
+            )
+
+        try:
+            declared_size = int(content_length)
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Content-Length must be a valid integer."},
+            )
+
+        if declared_size <= 0:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Content-Length must be greater than zero."},
+            )
+
+        if declared_size > MAX_UPLOAD_SIZE_BYTES:
+            return JSONResponse(
+                status_code=413,
+                content={
+                    "detail": f"Upload too large. Limit is {MAX_UPLOAD_SIZE_MB} MB per file."
+                },
+            )
+
+    return await call_next(request)
 
 # ── Azure Speech Services config ──
 AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
@@ -560,6 +653,10 @@ PROVIDER_LABELS = {
 
 MAX_RETRIES = 3
 RETRY_DELAY = 3
+MAX_UPLOAD_SIZE_MB = _get_env_int("MAX_UPLOAD_SIZE_MB", 256)
+MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+MAX_CONCURRENT_TRANSCRIPTIONS = _get_env_int("MAX_CONCURRENT_TRANSCRIPTIONS", 2)
+MAX_ACTIVE_BACKGROUND_JOBS = _get_env_int("MAX_ACTIVE_BACKGROUND_JOBS", 4)
 SPEECH_CHUNK_SECONDS = 50  # Azure Speech REST limit ~60s
 SPEECH_BACKGROUND_THRESHOLD_BYTES = 8 * 1024 * 1024
 SPEECH_CHUNK_CONCURRENCY = 4
@@ -571,6 +668,7 @@ GOOGLE_BACKGROUND_THRESHOLD_BYTES = 8 * 1024 * 1024
 GOOGLE_CHUNK_CONCURRENCY = 4
 TRANSCRIPTION_JOB_TTL_SECONDS = 60 * 60
 TRANSCRIPTION_JOBS = {}
+TRANSCRIPTION_RUNNER_SLOTS = asyncio.Semaphore(MAX_CONCURRENT_TRANSCRIPTIONS)
 
 _initialize_job_store()
 
@@ -650,7 +748,9 @@ async def _route_speech(filename: str, input_path: str, file_size: int, lang: st
             ),
         )
     try:
-        return await _speech_process(filename, input_path, locale)
+        return await _run_transcription_with_slot(
+            lambda: _speech_process(filename, input_path, locale)
+        )
     finally:
         _safe_remove_file(input_path)
 
@@ -801,7 +901,9 @@ async def _route_google(filename: str, input_path: str, file_size: int, lang: st
             ),
         )
     try:
-        return await _google_process(filename, input_path, locale, alternative_locales)
+        return await _run_transcription_with_slot(
+            lambda: _google_process(filename, input_path, locale, alternative_locales)
+        )
     finally:
         _safe_remove_file(input_path)
 
@@ -1000,7 +1102,9 @@ async def _route_openai(filename: str, input_path: str, file_size: int, lang: st
             ),
         )
     try:
-        return await _openai_process(filename, input_path, file_size, lang)
+        return await _run_transcription_with_slot(
+            lambda: _openai_process(filename, input_path, file_size, lang)
+        )
     finally:
         _safe_remove_file(input_path)
 
