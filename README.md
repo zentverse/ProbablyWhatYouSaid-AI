@@ -1,168 +1,105 @@
-# Probably what you said AI
+# ProbablyWhatYouSaid AI
 
-Probably what you said AI is a minimal transcription workspace built with
-Next.js. It lets you upload an audio file, choose a transcription engine, and
-read the result in two ways:
+ProbablyWhatYouSaid AI is a split frontend/backend workspace for audio transcription and browser-side video conversion.
 
-- a speaker-grouped conversation view when speaker metadata is available
-- a full transcript view for direct reading and copy/paste workflows
+The app lets you:
 
-This repository contains the frontend application. It expects a separate
-transcription API to be available and reachable from the browser.
+- upload audio and transcribe it with Azure Speech, GPT-4o Transcribe, or Google Speech-to-Text
+- review speaker-grouped output and the full transcript side by side
+- copy the final transcript to the clipboard from the results panel
+- upload an MP4 or MOV file, convert it to MP3 in the browser, and send that MP3 straight into the transcription flow
 
-## What the app does
+## Workspace layout
 
-The UI is designed around a simple transcription flow:
+- `frontend/` - Next.js 16 app for upload, conversion, transcription, and transcript review
+- `backend/` - FastAPI transcription API with Azure, OpenAI, and Google provider routing
 
-1. Select an audio file
-2. Choose the transcription engine
-3. Choose a language or leave it on auto-detect
-4. Submit the file to the API
-5. Watch status updates while the transcript is processed
-6. Review the returned transcript in a clean reading layout
+## Local setup
 
-Large files can be handled as background jobs by the API. When that happens,
-the frontend polls the job endpoint until the final transcript is ready.
-
-## Supported engines
-
-The current UI supports three backend providers:
-
-- `Azure Speech`
-- `GPT-4o Transcribe`
-- `Google Speech-to-Text`
-
-The actual availability of each provider depends on how the backend API is
-configured.
-
-## Supported languages
-
-The language picker includes:
-
-- Auto-detect
-- Sinhala
-- English
-- Tamil
-- Hindi
-- Arabic
-- Chinese
-- Japanese
-- Korean
-- French
-- German
-- Spanish
-- Portuguese
-- Russian
-- Swedish
-
-## Tech stack
-
-- Next.js 16
-- React 19
-- TypeScript
-- Tailwind CSS 4
-
-## API contract expected by the frontend
-
-The frontend expects a backend with these endpoints:
-
-- `POST /transcribe`
-- `GET /transcribe/jobs/{job_id}`
-
-The `POST /transcribe` endpoint should accept multipart form data with:
-
-- `file`
-- `language`
-- `provider`
-
-It should return either:
-
-- a completed transcript payload immediately, or
-- an HTTP `202` response with a background `job_id`
-
-The job endpoint should return status values like:
-
-- `queued`
-- `processing`
-- `completed`
-- `failed`
-
-## Transcript response shape
-
-The UI is built to handle responses that include:
-
-- `text`
-- `segments`
-- optional `speaker` values inside each segment
-
-When speaker information is present, the app renders grouped speaker blocks.
-When it is not present, the app falls back to the full transcript view without
-inventing speakers.
-
-## Local development
-
-Install dependencies:
+### 1. Frontend
 
 ```bash
+cd frontend
 npm install
 ```
 
-Start the dev server:
-
-```bash
-npm run dev
-```
-
-By default, Next.js runs on `http://localhost:3000`.
-
-If you want to run the frontend against a backend that only allows a specific
-origin such as `http://127.0.0.1:3100`, start it like this instead:
-
-```bash
-npm run dev -- --hostname 127.0.0.1 --port 3100
-```
-
-## Environment variables
-
-Create `.env.local` and set:
+Create `frontend/.env.local`:
 
 ```env
 NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8100
 ```
 
-This should point to the transcription API used by the app.
+Start the UI:
 
-## Available scripts
-
-- `npm run dev` - start the Next.js development server
-- `npm run build` - create a production build
-- `npm run start` - run the production server
-- `npm run lint` - lint the codebase
-
-## Project structure
-
-```text
-src/
-  app/
-    globals.css
-    layout.tsx
-    page.tsx
-  components/
-    TranscriberClient.tsx
+```bash
+npm run dev
 ```
 
-## UI behavior worth knowing
+By default, Next.js runs on `http://localhost:3000`. The backend sample CORS config also allows `3001` and `3100` if you need an alternate local port.
 
-- The word counter uses locale-aware segmentation when available.
-- Background-job polling retries transient connection failures before showing an error.
-- Sinhala users are warned when `GPT-4o Transcribe` is selected because Azure
-  Speech is generally the safer default for long Sinhala recordings.
+### 2. Backend
 
-## Production notes
+```bash
+cd backend
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
 
-This app can be deployed as a standard Next.js application. Make sure the
-deployed environment can reach the transcription API defined by
-`NEXT_PUBLIC_API_BASE_URL`.
+Copy the sample environment file and fill in the provider credentials you want to use:
 
-If the frontend and backend are hosted on different origins, configure backend
-CORS to allow the frontend origin.
+```bash
+copy .env.example .env
+```
+
+Start the API:
+
+```bash
+python -m uvicorn main:app --host 127.0.0.1 --port 8100
+```
+
+Backend docs are available at `http://127.0.0.1:8100/docs`.
+
+## Key frontend flows
+
+### Transcribe
+
+1. Upload an audio file.
+2. Choose the engine and language.
+3. Submit the file.
+4. Read the transcript in speaker-grouped and full-text layouts.
+5. Use the built-in copy button to place the full transcript on the clipboard.
+
+### Video to MP3
+
+1. Switch to `Video to MP3`.
+2. Upload an MP4 or MOV file.
+3. Wait for ffmpeg.wasm to generate the MP3 in the browser.
+4. The generated MP3 is automatically selected back in `Transcribe`.
+5. Download the MP3 or transcribe it immediately.
+
+## Scripts
+
+### Frontend
+
+- `npm run dev`
+- `npm run build`
+- `npm run start`
+- `npm run lint`
+
+### Backend
+
+- `python -m uvicorn main:app --host 127.0.0.1 --port 8100`
+- `python test_upload.py`
+
+## Notes
+
+- Large transcription jobs can be queued and polled through `GET /transcribe/jobs/{job_id}`.
+- Browser-side video conversion loads FFmpeg from jsDelivr on first use.
+- If frontend and backend run on different origins, update `CORS_ALLOWED_ORIGINS` in `backend/.env`.
+
+## Repo hygiene
+
+- Runtime secrets live in `.env` files and stay ignored.
+- Example env files such as `backend/.env.example` are committed on purpose.
+- Generated output such as `.next/`, logs, caches, and job store artifacts are ignored.
