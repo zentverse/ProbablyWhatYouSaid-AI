@@ -504,13 +504,54 @@ def _is_english_passage(text: str) -> bool:
     return _text_is_predominantly_english(text) and _looks_like_english(text)
 
 
+def _classify_english_piece(text: str) -> str:
+    """Label a sentence piece as 'en' (English), 'no' (not), or 'weak'.
+
+    'weak' is a short Latin fragment with too few common words to judge on its
+    own — it could be an English proper-noun list ("Ethiopian Arabica, Brazilian
+    Arabica") or a scrap of romanized speech ("Coffee espresso machine"). The
+    caller decides those by surrounding context.
+    """
+    if not _text_is_predominantly_english(text):
+        return "no"
+    tokens = re.findall(r"[A-Za-z]+", text)
+    if not tokens:
+        return "no"
+    ratio = sum(1 for token in tokens if token.lower() in _COMMON_ENGLISH_WORDS) / len(tokens)
+    if ratio >= _ENGLISH_MIN_RATIO:
+        return "en"
+    if len(tokens) >= _ENGLISH_MIN_WORDS:
+        return "no"  # long Latin run with almost no English words -> romanized
+    return "weak"
+
+
 def _english_only_text(text: str) -> str:
-    """Keep only the sentence-level pieces that read as English."""
+    """Keep only the sentence-level pieces that read as English.
+
+    Confident English is always kept and clear non-English is always dropped.
+    Short ambiguous fragments are kept only when isolated between English on
+    both sides, so a lone proper-noun list survives but a run of choppy
+    romanized fragments ("Coffee espresso machine. Vijesing espressoka. ...")
+    is dropped as a block.
+    """
     if not text or not text.strip():
         return ""
-    pieces = _SENTENCE_BOUNDARY_RE.split(text)
-    kept = [piece.strip() for piece in pieces if _is_english_passage(piece)]
-    return " ".join(part for part in kept if part).strip()
+    pieces = [piece.strip() for piece in _SENTENCE_BOUNDARY_RE.split(text) if piece.strip()]
+    if not pieces:
+        return ""
+
+    labels = [_classify_english_piece(piece) for piece in pieces]
+    last = len(pieces) - 1
+    kept = []
+    for i, piece in enumerate(pieces):
+        if labels[i] == "en":
+            kept.append(piece)
+        elif labels[i] == "weak":
+            prev_en = i == 0 or labels[i - 1] == "en"
+            next_en = i == last or labels[i + 1] == "en"
+            if prev_en and next_en:
+                kept.append(piece)
+    return " ".join(kept).strip()
 
 
 def _english_only_result(result: dict) -> dict:
