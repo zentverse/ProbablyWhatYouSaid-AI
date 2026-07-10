@@ -394,6 +394,69 @@ def _count_script_characters(text: str) -> tuple[int, int]:
     return sinhala_count, latin_count
 
 
+# Splits a transcript into sentence-ish pieces so we can keep or drop each one
+# by its dominant script. Handles English/Sinhala terminators and line breaks.
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?।])\s+|[\r\n]+")
+
+
+def _text_is_predominantly_english(text: str) -> bool:
+    """True when Latin letters outnumber Sinhala letters in the passage."""
+    sinhala_count, latin_count = _count_script_characters(text)
+    return latin_count > sinhala_count
+
+
+def _english_only_text(text: str) -> str:
+    """Keep only the sentence-level pieces that read as English."""
+    if not text or not text.strip():
+        return ""
+    pieces = _SENTENCE_BOUNDARY_RE.split(text)
+    kept = [piece.strip() for piece in pieces if _text_is_predominantly_english(piece)]
+    return " ".join(part for part in kept if part).strip()
+
+
+def _english_only_result(result: dict) -> dict:
+    """Filter a {text, segments} result down to its English passages.
+
+    Works for providers that return diarized segments (Azure, Google) and for
+    GPT-4o Transcribe, which usually returns only a `text` blob with no
+    segments. Whole segments that are dominated by Sinhala are dropped; kept
+    segments are additionally trimmed to their English sentences.
+    """
+    if not isinstance(result, dict):
+        return result
+
+    filtered = dict(result)
+    segments = result.get("segments") if isinstance(result.get("segments"), list) else []
+    kept_segments = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        segment_text = str(segment.get("text", ""))
+        if not _text_is_predominantly_english(segment_text):
+            continue
+        trimmed = _english_only_text(segment_text) or segment_text.strip()
+        if not trimmed:
+            continue
+        english_segment = dict(segment)
+        english_segment["text"] = trimmed
+        kept_segments.append(english_segment)
+
+    filtered["segments"] = kept_segments
+    if kept_segments:
+        filtered["text"] = " ".join(seg["text"] for seg in kept_segments).strip()
+    else:
+        # No usable segments (e.g. GPT-4o) — fall back to sentence filtering.
+        filtered["text"] = _english_only_text(str(result.get("text", "")))
+
+    return filtered
+
+
+def _apply_english_only(result: dict, english_only: bool) -> dict:
+    if not english_only:
+        return result
+    return _english_only_result(result)
+
+
 def _is_openai_language_drift(result: dict, lang: str) -> bool:
     if lang != "Sinhala":
         return False
@@ -682,20 +745,24 @@ async def transcribe(
     file: UploadFile = File(...),
     language: str = Form(default=""),
     provider: str = Form(default="speech"),   # "speech" | "openai" | "google"
+    english_only: bool = Form(default=False),
 ):
     temp_path, file_size = await _save_upload_to_temp(file)
     lang = language.strip()
     mode = provider.strip().lower()
 
-    log_debug(f"DEBUG - provider={mode}, file={file.filename}, size={file_size}, lang={lang}")
+    log_debug(
+        f"DEBUG - provider={mode}, file={file.filename}, size={file_size}, "
+        f"lang={lang}, english_only={english_only}"
+    )
 
     try:
         if mode == "openai":
-            return await _route_openai(file.filename, temp_path, file_size, lang)
+            return await _route_openai(file.filename, temp_path, file_size, lang, english_only)
         if mode == "google":
-            return await _route_google(file.filename, temp_path, file_size, lang)
+            return await _route_google(file.filename, temp_path, file_size, lang, english_only)
         if mode == "speech":
-            return await _route_speech(file.filename, temp_path, file_size, lang)
+            return await _route_speech(file.filename, temp_path, file_size, lang, english_only)
         raise HTTPException(400, f"Unsupported provider: {provider}")
     except Exception:
         _safe_remove_file(temp_path)
@@ -730,7 +797,9 @@ async def health():
 #  Provider 1 – Azure Speech Services  (Sinhala ✓)
 # ════════════════════════════════════════════════════════
 
-async def _route_speech(filename: str, input_path: str, file_size: int, lang: str):
+async def _route_speech(
+    filename: str, input_path: str, file_size: int, lang: str, english_only: bool = False
+):
     if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
         raise HTTPException(500, "Azure Speech credentials missing. Set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION in .env")
 
@@ -745,11 +814,12 @@ async def _route_speech(filename: str, input_path: str, file_size: int, lang: st
                 locale,
                 progress_callback=progress_callback,
                 concurrency=SPEECH_CHUNK_CONCURRENCY,
+                english_only=english_only,
             ),
         )
     try:
         return await _run_transcription_with_slot(
-            lambda: _speech_process(filename, input_path, locale)
+            lambda: _speech_process(filename, input_path, locale, english_only=english_only)
         )
     finally:
         _safe_remove_file(input_path)
@@ -761,6 +831,7 @@ async def _speech_process(
     locale: str,
     progress_callback=None,
     concurrency: int = 1,
+    english_only: bool = False,
 ):
     """Split → 16 kHz WAV chunks → Azure Speech REST API."""
     out_dir = tempfile.mkdtemp()
@@ -837,7 +908,9 @@ async def _speech_process(
                 )
             offset += SPEECH_CHUNK_SECONDS
 
-        return {"text": " ".join(all_text), "segments": all_segments}
+        return _apply_english_only(
+            {"text": " ".join(all_text), "segments": all_segments}, english_only
+        )
     finally:
         for f in os.listdir(out_dir):
             os.remove(os.path.join(out_dir, f))
@@ -877,7 +950,9 @@ async def _speech_recognise(audio: bytes, locale: str):
     raise HTTPException(500, "Speech retries exhausted")
 
 
-async def _route_google(filename: str, input_path: str, file_size: int, lang: str):
+async def _route_google(
+    filename: str, input_path: str, file_size: int, lang: str, english_only: bool = False
+):
     if google_speech is None:
         raise HTTPException(500, "Google Speech dependency missing. Install google-cloud-speech in the backend environment.")
 
@@ -898,11 +973,14 @@ async def _route_google(filename: str, input_path: str, file_size: int, lang: st
                 alternative_locales,
                 progress_callback=progress_callback,
                 concurrency=GOOGLE_CHUNK_CONCURRENCY,
+                english_only=english_only,
             ),
         )
     try:
         return await _run_transcription_with_slot(
-            lambda: _google_process(filename, input_path, locale, alternative_locales)
+            lambda: _google_process(
+                filename, input_path, locale, alternative_locales, english_only=english_only
+            )
         )
     finally:
         _safe_remove_file(input_path)
@@ -915,6 +993,7 @@ async def _google_process(
     alternative_locales: list[str],
     progress_callback=None,
     concurrency: int = 1,
+    english_only: bool = False,
 ):
     out_dir = tempfile.mkdtemp()
     out_pattern = os.path.join(out_dir, "chunk_%04d.wav")
@@ -980,7 +1059,9 @@ async def _google_process(
                 all_text.append(chunk_text)
             all_segments.extend(chunk_segments)
 
-        return {"text": " ".join(all_text).strip(), "segments": all_segments}
+        return _apply_english_only(
+            {"text": " ".join(all_text).strip(), "segments": all_segments}, english_only
+        )
     finally:
         for f in os.listdir(out_dir):
             os.remove(os.path.join(out_dir, f))
@@ -1084,7 +1165,9 @@ def _duration_to_seconds(duration) -> float:
 #  Provider 2 – Azure OpenAI  gpt-4o-transcribe
 # ════════════════════════════════════════════════════════
 
-async def _route_openai(filename: str, input_path: str, file_size: int, lang: str):
+async def _route_openai(
+    filename: str, input_path: str, file_size: int, lang: str, english_only: bool = False
+):
     if not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_KEY:
         raise HTTPException(500, "Azure OpenAI credentials missing. Set AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_KEY in .env")
 
@@ -1099,11 +1182,12 @@ async def _route_openai(filename: str, input_path: str, file_size: int, lang: st
                 lang,
                 progress_callback=progress_callback,
                 concurrency=OPENAI_CHUNK_CONCURRENCY,
+                english_only=english_only,
             ),
         )
     try:
         return await _run_transcription_with_slot(
-            lambda: _openai_process(filename, input_path, file_size, lang)
+            lambda: _openai_process(filename, input_path, file_size, lang, english_only=english_only)
         )
     finally:
         _safe_remove_file(input_path)
@@ -1116,6 +1200,7 @@ async def _openai_process(
     lang: str,
     progress_callback=None,
     concurrency: int = 1,
+    english_only: bool = False,
 ):
     if file_size < OPENAI_SINGLE_FILE_LIMIT_BYTES:
         if progress_callback:
@@ -1125,14 +1210,15 @@ async def _openai_process(
         result = await _openai_send(filename, audio_data, lang)
         if progress_callback:
             progress_callback(1, 1)
-        return result
-    return await _openai_large(
+        return _apply_english_only(result, english_only)
+    result = await _openai_large(
         filename,
         input_path,
         lang,
         progress_callback=progress_callback,
         concurrency=concurrency,
     )
+    return _apply_english_only(result, english_only)
 
 
 async def _openai_send(filename: str, audio_data: bytes, lang: str):

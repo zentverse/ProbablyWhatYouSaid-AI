@@ -86,16 +86,20 @@ export async function convertVideoToMp3(
   try {
     await ffmpeg.writeFile(inputName, await fetchFile(file));
 
+    // Encode speech-optimized audio: 16 kHz mono at 64 kbps. Every transcription
+    // provider downsamples to 16 kHz mono internally anyway, so this keeps full
+    // transcription quality while producing a file ~3x smaller than 44.1 kHz
+    // stereo — long recordings stay under the backend upload limit.
     await ffmpeg.exec([
       "-i",
       inputName,
       "-vn",
       "-ar",
-      "44100",
+      "16000",
       "-ac",
-      "2",
+      "1",
       "-b:a",
-      "192k",
+      "64k",
       outputName,
     ]);
 

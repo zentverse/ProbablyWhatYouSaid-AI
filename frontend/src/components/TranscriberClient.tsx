@@ -153,6 +153,7 @@ export default function TranscriberClient() {
   const [file, setFile] = useState<File | null>(null);
   const [language, setLanguage] = useState("Sinhala");
   const [provider, setProvider] = useState("speech");
+  const [englishOnly, setEnglishOnly] = useState(false);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<TranscriptResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -284,6 +285,7 @@ export default function TranscriberClient() {
     formData.append("file", file);
     formData.append("language", language);
     formData.append("provider", provider);
+    formData.append("english_only", String(englishOnly));
     const providerLabel = getProviderLabel(provider);
 
     try {
@@ -672,6 +674,26 @@ export default function TranscriberClient() {
                   ))}
                 </select>
               </div>
+
+              <label
+                htmlFor="english-only"
+                className="flex cursor-pointer items-start gap-3 rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-3 transition-all hover:border-white/20"
+              >
+                <input
+                  id="english-only"
+                  type="checkbox"
+                  checked={englishOnly}
+                  onChange={(e) => setEnglishOnly(e.target.checked)}
+                  className="mt-0.5 h-4 w-4 shrink-0 accent-cyan-300"
+                />
+                <span className="text-sm leading-6 text-slate-200">
+                  English only
+                  <span className="mt-0.5 block text-xs leading-5 text-slate-500">
+                    Keep only the passages spoken in English and drop the rest.
+                    Best for recordings that mix English with another language.
+                  </span>
+                </span>
+              </label>
 
               {openAiSinhalaWarning && (
                 <div className="rounded-2xl border border-amber-300/15 bg-amber-300/8 px-4 py-3 text-sm leading-7 text-amber-50">
