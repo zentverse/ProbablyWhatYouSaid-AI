@@ -273,7 +273,14 @@ def _collapse_repeated_phrases(
     return collapsed
 
 
-def _collapse_repeated_sentences(text: str) -> str:
+def _collapse_repeated_sentences(text: str, max_cycle: int = 6) -> str:
+    """Collapse immediately-repeating runs of sentences to a single copy.
+
+    Handles not just one sentence looping (A A A) but multi-sentence cycles
+    such as A B A B A B, which GPT-4o emits when it gets stuck on a chunk. For
+    each position the longest-spanning repeat is collapsed, and the smallest
+    period is kept so the run reduces to one fundamental copy.
+    """
     parts = [
         part.strip()
         for part in re.split(r"(?<=[.!?])\s+|\n+", text)
@@ -282,15 +289,39 @@ def _collapse_repeated_sentences(text: str) -> str:
     if len(parts) < 2:
         return text
 
-    cleaned_parts = []
-    last_key = None
+    keys = [
+        re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", part, flags=re.UNICODE)).strip().lower()
+        for part in parts
+    ]
 
-    for part in parts:
-        key = re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", part, flags=re.UNICODE)).strip()
-        if key and key == last_key:
-            continue
-        cleaned_parts.append(part)
-        last_key = key
+    cleaned_parts = []
+    n = len(parts)
+    i = 0
+    while i < n:
+        best_cycle = 0
+        best_span = 0
+        best_end = i
+        max_len = min(max_cycle, (n - i) // 2)
+        for cycle in range(1, max_len + 1):
+            block = keys[i:i + cycle]
+            if "" in block:
+                continue
+            repeats = 1
+            j = i + cycle
+            while j + cycle <= n and keys[j:j + cycle] == block:
+                repeats += 1
+                j += cycle
+            if repeats >= 2 and repeats * cycle > best_span:
+                best_span = repeats * cycle
+                best_cycle = cycle
+                best_end = j
+
+        if best_cycle:
+            cleaned_parts.extend(parts[i:i + best_cycle])  # keep one copy
+            i = best_end
+        else:
+            cleaned_parts.append(parts[i])
+            i += 1
 
     if len(cleaned_parts) == len(parts):
         return text
@@ -319,15 +350,35 @@ def _is_suspicious_repetition_token(token: str) -> bool:
     return unique_ratio < 0.45 or most_common_trigram >= max(4, len(trigrams) // 6)
 
 
+# Instruction-like strings the transcription model sometimes echoes into its
+# output instead of transcribing speech. They are never part of the audio, so
+# they are stripped wherever they appear (in full or as individual sentences).
+_TRANSCRIPTION_ARTIFACTS = [
+    "there may be provided context on the content of the audio or conversation",
+    "use this only as weak contextual guidance",
+    "the audio itself is authoritative",
+]
+_TRANSCRIPTION_ARTIFACT_RE = re.compile(
+    r"\s*(?:" + "|".join(re.escape(s) for s in _TRANSCRIPTION_ARTIFACTS) + r")\s*[.!?]*",
+    re.IGNORECASE,
+)
+
+
+def _strip_transcription_artifacts(text: str) -> str:
+    cleaned = _TRANSCRIPTION_ARTIFACT_RE.sub(" ", text)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 def _clean_openai_transcript_text(text: str) -> str:
     normalized = re.sub(r"\s+", " ", (text or "")).strip()
+    normalized = _strip_transcription_artifacts(normalized)
     if not normalized:
         return ""
 
     tokens = normalized.split(" ")
     tokens = [token for token in tokens if not _is_suspicious_repetition_token(token)]
     tokens = _collapse_repeated_tokens(tokens, max_repeat=2)
-    tokens = _collapse_repeated_phrases(tokens, max_phrase_tokens=12, min_repeats=3)
+    tokens = _collapse_repeated_phrases(tokens, max_phrase_tokens=24, min_repeats=3)
 
     cleaned = " ".join(tokens).strip()
     return _collapse_repeated_sentences(cleaned)
