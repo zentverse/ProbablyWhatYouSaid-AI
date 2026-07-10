@@ -405,12 +405,57 @@ def _text_is_predominantly_english(text: str) -> bool:
     return latin_count > sinhala_count
 
 
+# A compact set of high-frequency English words. Romanized Sinhala (and other
+# transliterated non-English text) is written in Latin letters, so the script
+# test above cannot catch it — but such text is almost devoid of these words,
+# while any genuine English sentence is dense with them. The ratio therefore
+# separates real English from romanized transliteration without a dictionary.
+_COMMON_ENGLISH_WORDS = frozenset({
+    "the", "a", "an", "and", "or", "but", "so", "if", "of", "to", "in", "on",
+    "at", "by", "for", "with", "from", "into", "about", "over", "under", "as",
+    "than", "then", "this", "that", "these", "those", "it", "its", "we", "you",
+    "they", "he", "she", "i", "me", "him", "her", "us", "them", "my", "your",
+    "our", "their", "his", "who", "which", "what", "is", "are", "was", "were",
+    "be", "been", "being", "have", "has", "had", "do", "does", "did", "will",
+    "would", "can", "could", "should", "may", "might", "must", "not", "no",
+    "all", "any", "some", "more", "most", "other", "such", "there", "here",
+    "when", "while", "because", "how", "also", "just", "only", "very", "like",
+    "one", "two", "up", "out", "down", "after", "before", "between", "through",
+    "get", "got", "make", "made", "go", "going", "went", "see", "use", "used",
+    "called", "each", "many", "much", "well", "now", "usually", "thereafter",
+})
+
+# Below this many Latin words the ratio test is unreliable, so short fragments
+# (proper-noun lists, brief phrases) are kept rather than risk dropping real
+# English. Romanized Sinhala arrives in much longer runs, so it is still caught.
+_ENGLISH_MIN_WORDS = 8
+_ENGLISH_MIN_RATIO = 0.12
+
+
+def _looks_like_english(text: str) -> bool:
+    """True when a Latin-script passage carries enough common English words.
+
+    Distinguishes genuine English from romanized Sinhala, which the script test
+    cannot — both are Latin, but only real English is dense with function words.
+    """
+    tokens = re.findall(r"[A-Za-z]+", text)
+    if len(tokens) < _ENGLISH_MIN_WORDS:
+        return True
+    hits = sum(1 for token in tokens if token.lower() in _COMMON_ENGLISH_WORDS)
+    return hits / len(tokens) >= _ENGLISH_MIN_RATIO
+
+
+def _is_english_passage(text: str) -> bool:
+    """Keep a passage only if it is Latin-script AND reads as real English."""
+    return _text_is_predominantly_english(text) and _looks_like_english(text)
+
+
 def _english_only_text(text: str) -> str:
     """Keep only the sentence-level pieces that read as English."""
     if not text or not text.strip():
         return ""
     pieces = _SENTENCE_BOUNDARY_RE.split(text)
-    kept = [piece.strip() for piece in pieces if _text_is_predominantly_english(piece)]
+    kept = [piece.strip() for piece in pieces if _is_english_passage(piece)]
     return " ".join(part for part in kept if part).strip()
 
 
@@ -432,7 +477,7 @@ def _english_only_result(result: dict) -> dict:
         if not isinstance(segment, dict):
             continue
         segment_text = str(segment.get("text", ""))
-        if not _text_is_predominantly_english(segment_text):
+        if not _is_english_passage(segment_text):
             continue
         trimmed = _english_only_text(segment_text) or segment_text.strip()
         if not trimmed:
