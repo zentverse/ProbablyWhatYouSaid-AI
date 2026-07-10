@@ -429,7 +429,10 @@ _COMMON_ENGLISH_WORDS = frozenset({
 # (proper-noun lists, brief phrases) are kept rather than risk dropping real
 # English. Romanized Sinhala arrives in much longer runs, so it is still caught.
 _ENGLISH_MIN_WORDS = 8
-_ENGLISH_MIN_RATIO = 0.12
+# Genuine English prose runs ~0.3-0.5 common-word density; romanized Sinhala is
+# near zero. 0.18 sits well clear of real English while rejecting romanized runs
+# that only clip the threshold via a single coincidental match ("Me" == "me").
+_ENGLISH_MIN_RATIO = 0.18
 
 
 def _looks_like_english(text: str) -> bool:
