@@ -1,16 +1,25 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   convertVideoToMp3,
-  ConvertedMp3Result,
   isSupportedVideoFile,
+  type ConvertedMp3Result,
 } from "@/lib/videoToMp3";
 
-type ConversionStatus = "idle" | "processing" | "success" | "error";
+type ItemStatus = "pending" | "processing" | "done" | "error";
+
+type ConversionItem = {
+  id: string;
+  file: File;
+  status: ItemStatus;
+  result?: ConvertedMp3Result;
+  downloadUrl?: string;
+  error?: string;
+};
 
 type VideoToMp3PanelProps = {
-  onMp3Ready: (result: ConvertedMp3Result) => void;
+  onMp3Ready: (results: ConvertedMp3Result[]) => void;
 };
 
 function formatFileSize(size: number): string {
@@ -26,53 +35,104 @@ function formatFileSize(size: number): string {
   return `${(size / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
-export default function VideoToMp3Panel({
-  onMp3Ready,
-}: VideoToMp3PanelProps) {
+function newId(seed: string): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return `${seed}-${Math.random()}`;
+}
+
+export default function VideoToMp3Panel({ onMp3Ready }: VideoToMp3PanelProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [file, setFile] = useState<File | null>(null);
-  const [status, setStatus] = useState<ConversionStatus>("idle");
-  const [error, setError] = useState<string | null>(null);
+  const [items, setItems] = useState<ConversionItem[]>([]);
+  const [isConverting, setIsConverting] = useState(false);
 
-  const resetState = () => {
-    setFile(null);
-    setStatus("idle");
-    setError(null);
+  const itemsRef = useRef<ConversionItem[]>(items);
+  useEffect(() => {
+    itemsRef.current = items;
+  }, [items]);
 
+  useEffect(() => {
+    return () => {
+      for (const item of itemsRef.current) {
+        if (item.downloadUrl) {
+          URL.revokeObjectURL(item.downloadUrl);
+        }
+      }
+    };
+  }, []);
+
+  const updateItem = (id: string, patch: Partial<ConversionItem>) => {
+    setItems((prev) =>
+      prev.map((item) => (item.id === id ? { ...item, ...patch } : item))
+    );
+  };
+
+  const addAndConvert = async (fileList: FileList | File[]) => {
+    const incoming: ConversionItem[] = Array.from(fileList).map((file) => {
+      const supported = isSupportedVideoFile(file);
+      return {
+        id: newId(file.name),
+        file,
+        status: supported ? "pending" : "error",
+        error: supported ? undefined : "Please upload an MP4 or MOV video file.",
+      };
+    });
+    if (incoming.length === 0) return;
+
+    setItems((prev) => [...prev, ...incoming]);
+    setIsConverting(true);
+
+    // ffmpeg.wasm is a single shared instance, so convert one at a time.
+    for (const item of incoming) {
+      if (item.status === "error") continue;
+      updateItem(item.id, { status: "processing" });
+      try {
+        const result = await convertVideoToMp3(item.file);
+        const url = URL.createObjectURL(result.blob);
+        updateItem(item.id, { status: "done", result, downloadUrl: url });
+      } catch (conversionError) {
+        updateItem(item.id, {
+          status: "error",
+          error:
+            conversionError instanceof Error
+              ? conversionError.message
+              : "The video could not be converted.",
+        });
+      }
+    }
+
+    setIsConverting(false);
+  };
+
+  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    if (event.target.files && event.target.files.length > 0) {
+      void addAndConvert(event.target.files);
+    }
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
   };
 
-  const handleVideoSelected = async (selectedFile: File) => {
-    if (!isSupportedVideoFile(selectedFile)) {
-      setFile(selectedFile);
-      setStatus("error");
-      setError("Please upload an MP4 or MOV video file.");
-      return;
+  const clearAll = () => {
+    for (const item of itemsRef.current) {
+      if (item.downloadUrl) {
+        URL.revokeObjectURL(item.downloadUrl);
+      }
     }
-
-    setFile(selectedFile);
-    setStatus("processing");
-    setError(null);
-
-    try {
-      const result = await convertVideoToMp3(selectedFile);
-      setStatus("success");
-      onMp3Ready(result);
-    } catch (conversionError) {
-      setStatus("error");
-      setError(
-        conversionError instanceof Error
-          ? conversionError.message
-          : "The video could not be converted."
-      );
-    }
+    setItems([]);
   };
 
-  const fileMeta = file
-    ? `${formatFileSize(file.size)} - ${file.type || "video file"}`
-    : "MP4 and MOV files are supported";
+  const doneResults = items
+    .filter((item) => item.status === "done" && item.result)
+    .map((item) => item.result!);
+
+  const statusLabel: Record<ItemStatus, string> = {
+    pending: "Queued",
+    processing: "Converting",
+    done: "Done",
+    error: "Failed",
+  };
 
   return (
     <div className="rounded-[1.75rem] border border-white/10 bg-black/20 p-5 backdrop-blur-xl sm:p-6">
@@ -93,12 +153,8 @@ export default function VideoToMp3Panel({
       <input
         type="file"
         accept="video/mp4,video/quicktime,.mp4,.mov"
-        onChange={(event) => {
-          const selectedFile = event.target.files?.[0];
-          if (selectedFile) {
-            void handleVideoSelected(selectedFile);
-          }
-        }}
+        multiple
+        onChange={handleFileChange}
         className="hidden"
         ref={fileInputRef}
       />
@@ -132,47 +188,93 @@ export default function VideoToMp3Panel({
           </div>
           <div className="min-w-0">
             <p className="truncate text-base font-medium text-white">
-              {file ? file.name : "Choose a video file"}
+              {items.length
+                ? `${items.length} video${items.length > 1 ? "s" : ""} selected`
+                : "Choose video files"}
             </p>
-            <p className="mt-1 text-sm text-slate-400">{fileMeta}</p>
+            <p className="mt-1 text-sm text-slate-400">
+              MP4 and MOV — pick one or many, converted in your browser
+            </p>
           </div>
         </div>
       </button>
 
-      <div className="mt-6 space-y-4">
-        <div className="rounded-2xl border border-white/8 bg-white/[0.02] px-4 py-4">
-          <p className="text-[11px] uppercase tracking-[0.24em] text-slate-500">
-            Flow
-          </p>
-          <p className="mt-3 text-sm leading-7 text-slate-300">
-            Uploading an MP4 or MOV starts conversion automatically. The MP3 is
-            created in your browser and then handed to the Transcribe tab as
-            the selected audio file.
-          </p>
+      {items.length > 0 && (
+        <div className="mt-4 space-y-2">
+          <div className="flex items-center justify-between px-1">
+            <p className="text-[11px] uppercase tracking-[0.24em] text-slate-500">
+              Files
+            </p>
+            <button
+              type="button"
+              onClick={clearAll}
+              disabled={isConverting}
+              className="text-xs text-slate-400 transition-colors hover:text-slate-200 disabled:opacity-50"
+            >
+              Clear all
+            </button>
+          </div>
+          <div className="custom-scrollbar max-h-64 space-y-2 overflow-y-auto pr-1">
+            {items.map((item) => (
+              <div
+                key={item.id}
+                className="flex items-center gap-3 rounded-2xl border border-white/8 bg-white/[0.02] px-3 py-2.5"
+              >
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm text-slate-100">
+                    {item.file.name}
+                  </p>
+                  <p className="truncate text-xs text-slate-500">
+                    {formatFileSize(item.file.size)}
+                    {item.error ? ` · ${item.error}` : ""}
+                  </p>
+                </div>
+                {item.status === "done" && item.downloadUrl && item.result && (
+                  <a
+                    href={item.downloadUrl}
+                    download={item.result.fileName}
+                    className="shrink-0 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1 text-[11px] font-medium text-slate-200 transition-all hover:bg-white/[0.08]"
+                  >
+                    Download
+                  </a>
+                )}
+                <span
+                  className={`shrink-0 rounded-full border px-2.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${
+                    item.status === "done"
+                      ? "border-emerald-300/25 bg-emerald-400/10 text-emerald-100"
+                      : item.status === "error"
+                        ? "border-rose-300/25 bg-rose-400/10 text-rose-100"
+                        : item.status === "processing"
+                          ? "border-cyan-300/25 bg-cyan-400/10 text-cyan-50"
+                          : "border-white/12 bg-white/[0.04] text-slate-300"
+                  }`}
+                >
+                  {statusLabel[item.status]}
+                </span>
+              </div>
+            ))}
+          </div>
         </div>
+      )}
 
-        {status === "processing" && (
+      <div className="mt-6 space-y-4">
+        {isConverting && (
           <div className="rounded-2xl border border-cyan-300/20 bg-cyan-400/8 px-4 py-3 text-sm leading-7 text-cyan-50">
-            Loading the conversion engine and preparing the MP3. Larger videos
-            may take a little longer.
+            Converting in the browser. Larger videos take a little longer, and
+            files convert one at a time.
           </div>
         )}
 
-        {status === "error" && error && (
-          <div className="rounded-2xl border border-rose-300/20 bg-rose-400/8 px-4 py-3 text-sm leading-7 text-rose-100">
-            {error}
-          </div>
-        )}
-
-        {(status === "idle" || status === "error") && (
-          <button
-            type="button"
-            onClick={resetState}
-            className="text-sm text-slate-400 transition-colors hover:text-slate-200"
-          >
-            Clear selection
-          </button>
-        )}
+        <button
+          type="button"
+          onClick={() => onMp3Ready(doneResults)}
+          disabled={doneResults.length === 0 || isConverting}
+          className="flex w-full items-center justify-center gap-3 rounded-full bg-white px-6 py-4 text-sm font-semibold text-slate-950 transition-all hover:bg-slate-100 disabled:cursor-not-allowed disabled:bg-white/40 disabled:text-slate-700"
+        >
+          {doneResults.length > 1
+            ? `Send ${doneResults.length} MP3s to Transcribe`
+            : "Send MP3 to Transcribe"}
+        </button>
       </div>
     </div>
   );
