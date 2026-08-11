@@ -9,8 +9,9 @@ import re
 from collections import Counter
 from uuid import uuid4
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.background import BackgroundTask
 import httpx
 import imageio_ffmpeg
 from dotenv import load_dotenv
@@ -67,6 +68,11 @@ def _get_env_int(name: str, default: int, *, minimum: int = 1) -> int:
 def _safe_remove_file(path: str | None) -> None:
     if path and os.path.exists(path):
         os.remove(path)
+
+
+def _safe_remove_files(*paths: str | None) -> None:
+    for path in paths:
+        _safe_remove_file(path)
 
 
 def _load_job_store() -> dict:
@@ -273,7 +279,14 @@ def _collapse_repeated_phrases(
     return collapsed
 
 
-def _collapse_repeated_sentences(text: str) -> str:
+def _collapse_repeated_sentences(text: str, max_cycle: int = 6) -> str:
+    """Collapse immediately-repeating runs of sentences to a single copy.
+
+    Handles not just one sentence looping (A A A) but multi-sentence cycles
+    such as A B A B A B, which GPT-4o emits when it gets stuck on a chunk. For
+    each position the longest-spanning repeat is collapsed, and the smallest
+    period is kept so the run reduces to one fundamental copy.
+    """
     parts = [
         part.strip()
         for part in re.split(r"(?<=[.!?])\s+|\n+", text)
@@ -282,15 +295,39 @@ def _collapse_repeated_sentences(text: str) -> str:
     if len(parts) < 2:
         return text
 
-    cleaned_parts = []
-    last_key = None
+    keys = [
+        re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", part, flags=re.UNICODE)).strip().lower()
+        for part in parts
+    ]
 
-    for part in parts:
-        key = re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", part, flags=re.UNICODE)).strip()
-        if key and key == last_key:
-            continue
-        cleaned_parts.append(part)
-        last_key = key
+    cleaned_parts = []
+    n = len(parts)
+    i = 0
+    while i < n:
+        best_cycle = 0
+        best_span = 0
+        best_end = i
+        max_len = min(max_cycle, (n - i) // 2)
+        for cycle in range(1, max_len + 1):
+            block = keys[i:i + cycle]
+            if "" in block:
+                continue
+            repeats = 1
+            j = i + cycle
+            while j + cycle <= n and keys[j:j + cycle] == block:
+                repeats += 1
+                j += cycle
+            if repeats >= 2 and repeats * cycle > best_span:
+                best_span = repeats * cycle
+                best_cycle = cycle
+                best_end = j
+
+        if best_cycle:
+            cleaned_parts.extend(parts[i:i + best_cycle])  # keep one copy
+            i = best_end
+        else:
+            cleaned_parts.append(parts[i])
+            i += 1
 
     if len(cleaned_parts) == len(parts):
         return text
@@ -319,15 +356,35 @@ def _is_suspicious_repetition_token(token: str) -> bool:
     return unique_ratio < 0.45 or most_common_trigram >= max(4, len(trigrams) // 6)
 
 
+# Instruction-like strings the transcription model sometimes echoes into its
+# output instead of transcribing speech. They are never part of the audio, so
+# they are stripped wherever they appear (in full or as individual sentences).
+_TRANSCRIPTION_ARTIFACTS = [
+    "there may be provided context on the content of the audio or conversation",
+    "use this only as weak contextual guidance",
+    "the audio itself is authoritative",
+]
+_TRANSCRIPTION_ARTIFACT_RE = re.compile(
+    r"\s*(?:" + "|".join(re.escape(s) for s in _TRANSCRIPTION_ARTIFACTS) + r")\s*[.!?]*",
+    re.IGNORECASE,
+)
+
+
+def _strip_transcription_artifacts(text: str) -> str:
+    cleaned = _TRANSCRIPTION_ARTIFACT_RE.sub(" ", text)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 def _clean_openai_transcript_text(text: str) -> str:
     normalized = re.sub(r"\s+", " ", (text or "")).strip()
+    normalized = _strip_transcription_artifacts(normalized)
     if not normalized:
         return ""
 
     tokens = normalized.split(" ")
     tokens = [token for token in tokens if not _is_suspicious_repetition_token(token)]
     tokens = _collapse_repeated_tokens(tokens, max_repeat=2)
-    tokens = _collapse_repeated_phrases(tokens, max_phrase_tokens=12, min_repeats=3)
+    tokens = _collapse_repeated_phrases(tokens, max_phrase_tokens=24, min_repeats=3)
 
     cleaned = " ".join(tokens).strip()
     return _collapse_repeated_sentences(cleaned)
@@ -394,6 +451,158 @@ def _count_script_characters(text: str) -> tuple[int, int]:
     return sinhala_count, latin_count
 
 
+# Splits a transcript into sentence-ish pieces so we can keep or drop each one
+# by its dominant script. Handles English/Sinhala terminators and line breaks.
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?।])\s+|[\r\n]+")
+
+
+def _text_is_predominantly_english(text: str) -> bool:
+    """True when Latin letters outnumber Sinhala letters in the passage."""
+    sinhala_count, latin_count = _count_script_characters(text)
+    return latin_count > sinhala_count
+
+
+# A compact set of high-frequency English words. Romanized Sinhala (and other
+# transliterated non-English text) is written in Latin letters, so the script
+# test above cannot catch it — but such text is almost devoid of these words,
+# while any genuine English sentence is dense with them. The ratio therefore
+# separates real English from romanized transliteration without a dictionary.
+_COMMON_ENGLISH_WORDS = frozenset({
+    "the", "a", "an", "and", "or", "but", "so", "if", "of", "to", "in", "on",
+    "at", "by", "for", "with", "from", "into", "about", "over", "under", "as",
+    "than", "then", "this", "that", "these", "those", "it", "its", "we", "you",
+    "they", "he", "she", "i", "me", "him", "her", "us", "them", "my", "your",
+    "our", "their", "his", "who", "which", "what", "is", "are", "was", "were",
+    "be", "been", "being", "have", "has", "had", "do", "does", "did", "will",
+    "would", "can", "could", "should", "may", "might", "must", "not", "no",
+    "all", "any", "some", "more", "most", "other", "such", "there", "here",
+    "when", "while", "because", "how", "also", "just", "only", "very", "like",
+    "one", "two", "up", "out", "down", "after", "before", "between", "through",
+    "get", "got", "make", "made", "go", "going", "went", "see", "use", "used",
+    "called", "each", "many", "much", "well", "now", "usually", "thereafter",
+})
+
+# Below this many Latin words the ratio test is unreliable, so short fragments
+# (proper-noun lists, brief phrases) are kept rather than risk dropping real
+# English. Romanized Sinhala arrives in much longer runs, so it is still caught.
+_ENGLISH_MIN_WORDS = 8
+# Genuine English prose runs ~0.3-0.5 common-word density; romanized Sinhala is
+# near zero. 0.18 sits well clear of real English while rejecting romanized runs
+# that only clip the threshold via a single coincidental match ("Me" == "me").
+_ENGLISH_MIN_RATIO = 0.18
+
+
+def _looks_like_english(text: str) -> bool:
+    """True when a Latin-script passage carries enough common English words.
+
+    Distinguishes genuine English from romanized Sinhala, which the script test
+    cannot — both are Latin, but only real English is dense with function words.
+    """
+    tokens = re.findall(r"[A-Za-z]+", text)
+    if len(tokens) < _ENGLISH_MIN_WORDS:
+        return True
+    hits = sum(1 for token in tokens if token.lower() in _COMMON_ENGLISH_WORDS)
+    return hits / len(tokens) >= _ENGLISH_MIN_RATIO
+
+
+def _is_english_passage(text: str) -> bool:
+    """Keep a passage only if it is Latin-script AND reads as real English."""
+    return _text_is_predominantly_english(text) and _looks_like_english(text)
+
+
+def _classify_english_piece(text: str) -> str:
+    """Label a sentence piece as 'en' (English), 'no' (not), or 'weak'.
+
+    'weak' is a short Latin fragment with too few common words to judge on its
+    own — it could be an English proper-noun list ("Ethiopian Arabica, Brazilian
+    Arabica") or a scrap of romanized speech ("Coffee espresso machine"). The
+    caller decides those by surrounding context.
+    """
+    if not _text_is_predominantly_english(text):
+        return "no"
+    tokens = re.findall(r"[A-Za-z]+", text)
+    if not tokens:
+        return "no"
+    ratio = sum(1 for token in tokens if token.lower() in _COMMON_ENGLISH_WORDS) / len(tokens)
+    if ratio >= _ENGLISH_MIN_RATIO:
+        return "en"
+    if len(tokens) >= _ENGLISH_MIN_WORDS:
+        return "no"  # long Latin run with almost no English words -> romanized
+    return "weak"
+
+
+def _english_only_text(text: str) -> str:
+    """Keep only the sentence-level pieces that read as English.
+
+    Confident English is always kept and clear non-English is always dropped.
+    Short ambiguous fragments are kept only when isolated between English on
+    both sides, so a lone proper-noun list survives but a run of choppy
+    romanized fragments ("Coffee espresso machine. Vijesing espressoka. ...")
+    is dropped as a block.
+    """
+    if not text or not text.strip():
+        return ""
+    pieces = [piece.strip() for piece in _SENTENCE_BOUNDARY_RE.split(text) if piece.strip()]
+    if not pieces:
+        return ""
+
+    labels = [_classify_english_piece(piece) for piece in pieces]
+    last = len(pieces) - 1
+    kept = []
+    for i, piece in enumerate(pieces):
+        if labels[i] == "en":
+            kept.append(piece)
+        elif labels[i] == "weak":
+            prev_en = i == 0 or labels[i - 1] == "en"
+            next_en = i == last or labels[i + 1] == "en"
+            if prev_en and next_en:
+                kept.append(piece)
+    return " ".join(kept).strip()
+
+
+def _english_only_result(result: dict) -> dict:
+    """Filter a {text, segments} result down to its English passages.
+
+    Works for providers that return diarized segments (Azure, Google) and for
+    GPT-4o Transcribe, which usually returns only a `text` blob with no
+    segments. Whole segments that are dominated by Sinhala are dropped; kept
+    segments are additionally trimmed to their English sentences.
+    """
+    if not isinstance(result, dict):
+        return result
+
+    filtered = dict(result)
+    segments = result.get("segments") if isinstance(result.get("segments"), list) else []
+    kept_segments = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        segment_text = str(segment.get("text", ""))
+        if not _is_english_passage(segment_text):
+            continue
+        trimmed = _english_only_text(segment_text) or segment_text.strip()
+        if not trimmed:
+            continue
+        english_segment = dict(segment)
+        english_segment["text"] = trimmed
+        kept_segments.append(english_segment)
+
+    filtered["segments"] = kept_segments
+    if kept_segments:
+        filtered["text"] = " ".join(seg["text"] for seg in kept_segments).strip()
+    else:
+        # No usable segments (e.g. GPT-4o) — fall back to sentence filtering.
+        filtered["text"] = _english_only_text(str(result.get("text", "")))
+
+    return filtered
+
+
+def _apply_english_only(result: dict, english_only: bool) -> dict:
+    if not english_only:
+        return result
+    return _english_only_result(result)
+
+
 def _is_openai_language_drift(result: dict, lang: str) -> bool:
     if lang != "Sinhala":
         return False
@@ -418,10 +627,17 @@ def _is_openai_language_drift(result: dict, lang: str) -> bool:
     return False
 
 
-async def _save_upload_to_temp(upload: UploadFile) -> tuple[str, int]:
+async def _save_upload_to_temp(
+    upload: UploadFile,
+    *,
+    max_size_bytes: int | None = None,
+    max_size_mb: int | None = None,
+) -> tuple[str, int]:
     suffix = os.path.splitext(upload.filename or "")[1] or ".bin"
     size = 0
     temp_path = None
+    size_limit = max_size_bytes or MAX_UPLOAD_SIZE_BYTES
+    size_limit_mb = max_size_mb or MAX_UPLOAD_SIZE_MB
 
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -431,10 +647,10 @@ async def _save_upload_to_temp(upload: UploadFile) -> tuple[str, int]:
                 if not chunk:
                     break
                 size += len(chunk)
-                if size > MAX_UPLOAD_SIZE_BYTES:
+                if size > size_limit:
                     raise HTTPException(
                         413,
-                        f"Upload too large. Limit is {MAX_UPLOAD_SIZE_MB} MB per file.",
+                        f"Upload too large. Limit is {size_limit_mb} MB per file.",
                     )
                 tmp.write(chunk)
     except Exception:
@@ -444,6 +660,52 @@ async def _save_upload_to_temp(upload: UploadFile) -> tuple[str, int]:
         await upload.close()
 
     return temp_path, size
+
+
+def _converted_mp3_filename(filename: str | None) -> str:
+    source_name = os.path.basename(filename or "video")
+    stem = os.path.splitext(source_name)[0].strip() or "video"
+    return f"{stem}.mp3"
+
+
+async def _convert_video_file_to_mp3(input_path: str, output_path: str) -> None:
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    process = await asyncio.create_subprocess_exec(
+        ffmpeg_exe,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-y",
+        "-i",
+        input_path,
+        "-map",
+        "0:a:0",
+        "-vn",
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        "-b:a",
+        "64k",
+        output_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await process.communicate()
+
+    if process.returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        if len(detail) > 800:
+            detail = detail[-800:]
+        raise HTTPException(
+            422,
+            "FFmpeg could not extract audio from this video. "
+            + (detail or "The file may be damaged, encrypted, or missing an audio track."),
+        )
+
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        raise HTTPException(422, "The video did not contain a usable audio track.")
 
 
 def _count_active_background_jobs() -> int:
@@ -540,24 +802,19 @@ async def _run_transcription_job(job_id: str, provider: str, runner_factory):
     finally:
         _safe_remove_file(temp_path)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=CORS_ALLOWED_ORIGINS
-    or [
-        "http://127.0.0.1:3000",
-        "http://localhost:3000",
-        "http://127.0.0.1:3001",
-        "http://localhost:3001",
-    ],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
 @app.middleware("http")
 async def enforce_upload_limits(request: Request, call_next):
-    if request.method == "POST" and request.url.path == "/transcribe":
+    upload_limits = {
+        "/transcribe": (MAX_UPLOAD_SIZE_BYTES, MAX_UPLOAD_SIZE_MB),
+        "/convert/video-to-mp3": (
+            MAX_VIDEO_UPLOAD_SIZE_BYTES,
+            MAX_VIDEO_UPLOAD_SIZE_MB,
+        ),
+    }
+    upload_limit = upload_limits.get(request.url.path)
+
+    if request.method == "POST" and upload_limit:
+        max_size_bytes, max_size_mb = upload_limit
         content_type = request.headers.get("content-type", "")
         if "multipart/form-data" not in content_type.lower():
             return JSONResponse(
@@ -572,7 +829,7 @@ async def enforce_upload_limits(request: Request, call_next):
                 content={
                     "detail": (
                         "Content-Length is required for uploads and must stay within "
-                        f"the {MAX_UPLOAD_SIZE_MB} MB file limit."
+                        f"the {max_size_mb} MB file limit."
                     )
                 },
             )
@@ -591,15 +848,33 @@ async def enforce_upload_limits(request: Request, call_next):
                 content={"detail": "Content-Length must be greater than zero."},
             )
 
-        if declared_size > MAX_UPLOAD_SIZE_BYTES:
+        # Multipart boundaries and headers add a small amount beyond the file itself.
+        if declared_size > max_size_bytes + MULTIPART_OVERHEAD_ALLOWANCE_BYTES:
             return JSONResponse(
                 status_code=413,
                 content={
-                    "detail": f"Upload too large. Limit is {MAX_UPLOAD_SIZE_MB} MB per file."
+                    "detail": f"Upload too large. Limit is {max_size_mb} MB per file."
                 },
             )
 
     return await call_next(request)
+
+
+# Register CORS after the upload guard so it remains the outer middleware and
+# adds browser-readable headers even when the guard rejects a request early.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ALLOWED_ORIGINS
+    or [
+        "http://127.0.0.1:3000",
+        "http://localhost:3000",
+        "http://127.0.0.1:3001",
+        "http://localhost:3001",
+    ],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ── Azure Speech Services config ──
 AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
@@ -655,6 +930,9 @@ MAX_RETRIES = 3
 RETRY_DELAY = 3
 MAX_UPLOAD_SIZE_MB = _get_env_int("MAX_UPLOAD_SIZE_MB", 256)
 MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+MAX_VIDEO_UPLOAD_SIZE_MB = _get_env_int("MAX_VIDEO_UPLOAD_SIZE_MB", 8192)
+MAX_VIDEO_UPLOAD_SIZE_BYTES = MAX_VIDEO_UPLOAD_SIZE_MB * 1024 * 1024
+MULTIPART_OVERHEAD_ALLOWANCE_BYTES = 1024 * 1024
 MAX_CONCURRENT_TRANSCRIPTIONS = _get_env_int("MAX_CONCURRENT_TRANSCRIPTIONS", 2)
 MAX_ACTIVE_BACKGROUND_JOBS = _get_env_int("MAX_ACTIVE_BACKGROUND_JOBS", 4)
 SPEECH_CHUNK_SECONDS = 50  # Azure Speech REST limit ~60s
@@ -682,24 +960,65 @@ async def transcribe(
     file: UploadFile = File(...),
     language: str = Form(default=""),
     provider: str = Form(default="speech"),   # "speech" | "openai" | "google"
+    english_only: bool = Form(default=False),
 ):
     temp_path, file_size = await _save_upload_to_temp(file)
     lang = language.strip()
     mode = provider.strip().lower()
 
-    log_debug(f"DEBUG - provider={mode}, file={file.filename}, size={file_size}, lang={lang}")
+    log_debug(
+        f"DEBUG - provider={mode}, file={file.filename}, size={file_size}, "
+        f"lang={lang}, english_only={english_only}"
+    )
 
     try:
         if mode == "openai":
-            return await _route_openai(file.filename, temp_path, file_size, lang)
+            return await _route_openai(file.filename, temp_path, file_size, lang, english_only)
         if mode == "google":
-            return await _route_google(file.filename, temp_path, file_size, lang)
+            return await _route_google(file.filename, temp_path, file_size, lang, english_only)
         if mode == "speech":
-            return await _route_speech(file.filename, temp_path, file_size, lang)
+            return await _route_speech(file.filename, temp_path, file_size, lang, english_only)
         raise HTTPException(400, f"Unsupported provider: {provider}")
     except Exception:
         _safe_remove_file(temp_path)
         raise
+
+
+@app.post("/convert/video-to-mp3")
+async def convert_video_to_mp3(file: UploadFile = File(...)):
+    extension = os.path.splitext(file.filename or "")[1].lower()
+    if extension not in {".mp4", ".mov"}:
+        await file.close()
+        raise HTTPException(415, "Only MP4 and MOV video files are supported.")
+
+    input_path = None
+    output_path = None
+    try:
+        input_path, file_size = await _save_upload_to_temp(
+            file,
+            max_size_bytes=MAX_VIDEO_UPLOAD_SIZE_BYTES,
+            max_size_mb=MAX_VIDEO_UPLOAD_SIZE_MB,
+        )
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as output_file:
+            output_path = output_file.name
+
+        log_debug(
+            f"DEBUG - native video conversion file={file.filename}, size={file_size}"
+        )
+        await _convert_video_file_to_mp3(input_path, output_path)
+
+        cleanup = BackgroundTask(_safe_remove_files, input_path, output_path)
+        response = FileResponse(
+            output_path,
+            media_type="audio/mpeg",
+            filename=_converted_mp3_filename(file.filename),
+            background=cleanup,
+        )
+        input_path = None
+        output_path = None
+        return response
+    finally:
+        _safe_remove_files(input_path, output_path)
 
 
 @app.get("/transcribe/jobs/{job_id}")
@@ -730,7 +1049,9 @@ async def health():
 #  Provider 1 – Azure Speech Services  (Sinhala ✓)
 # ════════════════════════════════════════════════════════
 
-async def _route_speech(filename: str, input_path: str, file_size: int, lang: str):
+async def _route_speech(
+    filename: str, input_path: str, file_size: int, lang: str, english_only: bool = False
+):
     if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
         raise HTTPException(500, "Azure Speech credentials missing. Set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION in .env")
 
@@ -745,11 +1066,12 @@ async def _route_speech(filename: str, input_path: str, file_size: int, lang: st
                 locale,
                 progress_callback=progress_callback,
                 concurrency=SPEECH_CHUNK_CONCURRENCY,
+                english_only=english_only,
             ),
         )
     try:
         return await _run_transcription_with_slot(
-            lambda: _speech_process(filename, input_path, locale)
+            lambda: _speech_process(filename, input_path, locale, english_only=english_only)
         )
     finally:
         _safe_remove_file(input_path)
@@ -761,6 +1083,7 @@ async def _speech_process(
     locale: str,
     progress_callback=None,
     concurrency: int = 1,
+    english_only: bool = False,
 ):
     """Split → 16 kHz WAV chunks → Azure Speech REST API."""
     out_dir = tempfile.mkdtemp()
@@ -837,7 +1160,9 @@ async def _speech_process(
                 )
             offset += SPEECH_CHUNK_SECONDS
 
-        return {"text": " ".join(all_text), "segments": all_segments}
+        return _apply_english_only(
+            {"text": " ".join(all_text), "segments": all_segments}, english_only
+        )
     finally:
         for f in os.listdir(out_dir):
             os.remove(os.path.join(out_dir, f))
@@ -877,7 +1202,9 @@ async def _speech_recognise(audio: bytes, locale: str):
     raise HTTPException(500, "Speech retries exhausted")
 
 
-async def _route_google(filename: str, input_path: str, file_size: int, lang: str):
+async def _route_google(
+    filename: str, input_path: str, file_size: int, lang: str, english_only: bool = False
+):
     if google_speech is None:
         raise HTTPException(500, "Google Speech dependency missing. Install google-cloud-speech in the backend environment.")
 
@@ -898,11 +1225,14 @@ async def _route_google(filename: str, input_path: str, file_size: int, lang: st
                 alternative_locales,
                 progress_callback=progress_callback,
                 concurrency=GOOGLE_CHUNK_CONCURRENCY,
+                english_only=english_only,
             ),
         )
     try:
         return await _run_transcription_with_slot(
-            lambda: _google_process(filename, input_path, locale, alternative_locales)
+            lambda: _google_process(
+                filename, input_path, locale, alternative_locales, english_only=english_only
+            )
         )
     finally:
         _safe_remove_file(input_path)
@@ -915,6 +1245,7 @@ async def _google_process(
     alternative_locales: list[str],
     progress_callback=None,
     concurrency: int = 1,
+    english_only: bool = False,
 ):
     out_dir = tempfile.mkdtemp()
     out_pattern = os.path.join(out_dir, "chunk_%04d.wav")
@@ -980,7 +1311,9 @@ async def _google_process(
                 all_text.append(chunk_text)
             all_segments.extend(chunk_segments)
 
-        return {"text": " ".join(all_text).strip(), "segments": all_segments}
+        return _apply_english_only(
+            {"text": " ".join(all_text).strip(), "segments": all_segments}, english_only
+        )
     finally:
         for f in os.listdir(out_dir):
             os.remove(os.path.join(out_dir, f))
@@ -1084,7 +1417,9 @@ def _duration_to_seconds(duration) -> float:
 #  Provider 2 – Azure OpenAI  gpt-4o-transcribe
 # ════════════════════════════════════════════════════════
 
-async def _route_openai(filename: str, input_path: str, file_size: int, lang: str):
+async def _route_openai(
+    filename: str, input_path: str, file_size: int, lang: str, english_only: bool = False
+):
     if not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_KEY:
         raise HTTPException(500, "Azure OpenAI credentials missing. Set AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_KEY in .env")
 
@@ -1099,11 +1434,12 @@ async def _route_openai(filename: str, input_path: str, file_size: int, lang: st
                 lang,
                 progress_callback=progress_callback,
                 concurrency=OPENAI_CHUNK_CONCURRENCY,
+                english_only=english_only,
             ),
         )
     try:
         return await _run_transcription_with_slot(
-            lambda: _openai_process(filename, input_path, file_size, lang)
+            lambda: _openai_process(filename, input_path, file_size, lang, english_only=english_only)
         )
     finally:
         _safe_remove_file(input_path)
@@ -1116,6 +1452,7 @@ async def _openai_process(
     lang: str,
     progress_callback=None,
     concurrency: int = 1,
+    english_only: bool = False,
 ):
     if file_size < OPENAI_SINGLE_FILE_LIMIT_BYTES:
         if progress_callback:
@@ -1125,14 +1462,15 @@ async def _openai_process(
         result = await _openai_send(filename, audio_data, lang)
         if progress_callback:
             progress_callback(1, 1)
-        return result
-    return await _openai_large(
+        return _apply_english_only(result, english_only)
+    result = await _openai_large(
         filename,
         input_path,
         lang,
         progress_callback=progress_callback,
         concurrency=concurrency,
     )
+    return _apply_english_only(result, english_only)
 
 
 async def _openai_send(filename: str, audio_data: bytes, lang: str):
