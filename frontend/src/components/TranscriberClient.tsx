@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import VideoToMp3Panel from "@/components/VideoToMp3Panel";
 import {
-  convertVideoToMp3,
+  convertVideoToMp3Reliably,
   isSupportedVideoFile,
   type ConvertedMp3Result,
 } from "@/lib/videoToMp3";
@@ -262,6 +262,8 @@ export default function TranscriberClient() {
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copiedJobId, setCopiedJobId] = useState<string | null>(null);
+  const [draggedJobId, setDraggedJobId] = useState<string | null>(null);
+  const [dragOverJobId, setDragOverJobId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Keep the latest jobs in a ref so async work reads current file references.
@@ -327,6 +329,85 @@ export default function TranscriberClient() {
       }
       return prev.filter((job) => job.id !== id);
     });
+  };
+
+  const reorderJobs = (sourceId: string, targetId: string) => {
+    if (isRunning || sourceId === targetId) return;
+
+    setJobs((prev) => {
+      const sourceIndex = prev.findIndex((job) => job.id === sourceId);
+      const targetIndex = prev.findIndex((job) => job.id === targetId);
+      if (sourceIndex < 0 || targetIndex < 0) return prev;
+
+      const reordered = [...prev];
+      const [movedJob] = reordered.splice(sourceIndex, 1);
+      reordered.splice(targetIndex, 0, movedJob);
+      return reordered;
+    });
+  };
+
+  const moveJob = (id: string, offset: -1 | 1) => {
+    if (isRunning) return;
+
+    setJobs((prev) => {
+      const sourceIndex = prev.findIndex((job) => job.id === id);
+      const targetIndex = sourceIndex + offset;
+      if (
+        sourceIndex < 0 ||
+        targetIndex < 0 ||
+        targetIndex >= prev.length
+      ) {
+        return prev;
+      }
+
+      const reordered = [...prev];
+      [reordered[sourceIndex], reordered[targetIndex]] = [
+        reordered[targetIndex],
+        reordered[sourceIndex],
+      ];
+      return reordered;
+    });
+  };
+
+  const handleJobDragStart = (
+    event: React.DragEvent<HTMLElement>,
+    jobId: string
+  ) => {
+    if (isRunning || jobs.length < 2) {
+      event.preventDefault();
+      return;
+    }
+
+    setDraggedJobId(jobId);
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", jobId);
+  };
+
+  const handleJobDragOver = (
+    event: React.DragEvent<HTMLDivElement>,
+    jobId: string
+  ) => {
+    if (isRunning || !draggedJobId || draggedJobId === jobId) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    setDragOverJobId(jobId);
+  };
+
+  const handleJobDrop = (
+    event: React.DragEvent<HTMLDivElement>,
+    targetId: string
+  ) => {
+    event.preventDefault();
+    const sourceId =
+      draggedJobId || event.dataTransfer.getData("text/plain");
+    if (sourceId) reorderJobs(sourceId, targetId);
+    setDraggedJobId(null);
+    setDragOverJobId(null);
+  };
+
+  const handleJobDragEnd = () => {
+    setDraggedJobId(null);
+    setDragOverJobId(null);
   };
 
   const clearJobs = () => {
@@ -485,16 +566,21 @@ export default function TranscriberClient() {
     setIsRunning(true);
     setError(null);
 
-    // 1. Convert videos one at a time (ffmpeg.wasm is a single shared instance).
+    // 1. Convert videos one at a time. Large files and browser failures use the
+    // backend's native FFmpeg path so they do not exhaust WebAssembly memory.
     for (const job of pending) {
       if (job.isVideo && !job.audioFile) {
         updateJob(job.id, {
           status: "converting",
-          statusMessage: "Converting to MP3...",
+          statusMessage: "Preparing video conversion...",
           error: undefined,
         });
         try {
-          const res = await convertVideoToMp3(job.sourceFile);
+          const res = await convertVideoToMp3Reliably(
+            job.sourceFile,
+            API_BASE_URL,
+            (statusMessage) => updateJob(job.id, { statusMessage })
+          );
           job.audioFile = res.file;
           job.audioFileName = res.fileName;
           const url = URL.createObjectURL(res.blob);
@@ -521,7 +607,8 @@ export default function TranscriberClient() {
       }
     }
 
-    // 2. Transcribe everything that has audio, concurrently.
+    // 2. Transcribe in the selected queue order. Requests run concurrently,
+    // while the jobs array remains the source of truth for result-card order.
     const ready = pending.filter(
       (job) => job.audioFile && job.status !== "error"
     );
@@ -544,13 +631,13 @@ export default function TranscriberClient() {
   const isTranscribeMode = mode === "transcribe";
   const selectedProvider =
     PROVIDERS.find((item) => item.id === provider) ?? PROVIDERS[0];
-  const selectedLanguage =
-    LANGUAGES.find((item) => item.code === language)?.label ?? "Auto-detect";
   const openAiSinhalaWarning =
     provider === "openai" && language === "Sinhala"
       ? "GPT-4o can drift or repeat on long Sinhala recordings. Azure Speech is usually the safer primary result, with OpenAI best used as a second opinion."
       : null;
 
+  // Filtering preserves the user-selected queue order even when concurrent
+  // transcription requests finish in a different order.
   const doneJobs = jobs.filter((job) => job.status === "done" && job.result);
   const pendingCount = jobs.filter(
     (job) => job.status !== "done" || !job.result
@@ -565,8 +652,8 @@ export default function TranscriberClient() {
     ? "Cleaner transcripts, less interface noise."
     : "Turn video uploads into clean MP3 downloads.";
   const heroDescription = isTranscribeMode
-    ? "Drop in one file or a whole batch of audio and video. Videos are converted to MP3 in the browser, then everything is transcribed together."
-    : "Drop in one or many MP4/MOV files and the app converts each to MP3 in the browser, ready to download or hand straight to the Transcribe flow.";
+    ? "Drop in one file or a whole batch of audio and video. Large videos use native conversion, then everything is transcribed together."
+    : "Drop in one or many MP4/MOV files. Large videos use native conversion automatically, ready to download or hand straight to the Transcribe flow.";
 
   const heroStats = isTranscribeMode
     ? [
@@ -717,10 +804,20 @@ export default function TranscriberClient() {
 
             {jobs.length > 0 && (
               <div className="mt-4 space-y-2">
-                <div className="flex items-center justify-between px-1">
-                  <p className="text-[11px] uppercase tracking-[0.24em] text-slate-500">
-                    Queue
-                  </p>
+                <div className="flex items-start justify-between gap-4 px-1">
+                  <div>
+                    <p className="text-[11px] uppercase tracking-[0.24em] text-slate-500">
+                      Queue
+                    </p>
+                    {jobs.length > 1 && (
+                      <p
+                        id="queue-order-help"
+                        className="mt-1 text-xs leading-5 text-slate-500"
+                      >
+                        Drag files or use the arrows. Results keep this order.
+                      </p>
+                    )}
+                  </div>
                   <button
                     type="button"
                     onClick={clearJobs}
@@ -731,12 +828,52 @@ export default function TranscriberClient() {
                   </button>
                 </div>
                 <div className="custom-scrollbar max-h-64 space-y-2 overflow-y-auto pr-1">
-                  {jobs.map((job) => (
+                  {jobs.map((job, index) => (
                     <div
                       key={job.id}
-                      className="flex items-center gap-3 rounded-2xl border border-white/8 bg-white/[0.02] px-3 py-2.5"
+                      onDragOver={(event) =>
+                        handleJobDragOver(event, job.id)
+                      }
+                      onDrop={(event) => handleJobDrop(event, job.id)}
+                      className={`flex items-center gap-2 rounded-2xl border px-2.5 py-2.5 transition-all ${
+                        dragOverJobId === job.id
+                          ? "border-cyan-300/45 bg-cyan-300/[0.07]"
+                          : "border-white/8 bg-white/[0.02]"
+                      } ${draggedJobId === job.id ? "opacity-45" : ""}`}
                     >
-                      <span className="text-[11px] text-slate-500">
+                      <span
+                        draggable={!isRunning && jobs.length > 1}
+                        onDragStart={(event) =>
+                          handleJobDragStart(event, job.id)
+                        }
+                        onDragEnd={handleJobDragEnd}
+                        title={
+                          isRunning ? "Ordering is locked while processing" : "Drag to reorder"
+                        }
+                        aria-hidden="true"
+                        className={`grid h-8 w-5 shrink-0 place-items-center text-slate-600 transition-colors hover:text-slate-300 ${
+                          isRunning || jobs.length < 2
+                            ? "cursor-default"
+                            : "cursor-grab active:cursor-grabbing"
+                        }`}
+                      >
+                        <svg
+                          className="h-4 w-4"
+                          fill="currentColor"
+                          viewBox="0 0 24 24"
+                        >
+                          <circle cx="8" cy="6" r="1.4" />
+                          <circle cx="16" cy="6" r="1.4" />
+                          <circle cx="8" cy="12" r="1.4" />
+                          <circle cx="16" cy="12" r="1.4" />
+                          <circle cx="8" cy="18" r="1.4" />
+                          <circle cx="16" cy="18" r="1.4" />
+                        </svg>
+                      </span>
+                      <span className="w-5 shrink-0 text-center text-[11px] tabular-nums text-slate-500">
+                        {index + 1}
+                      </span>
+                      <span className="w-7 shrink-0 text-[10px] text-slate-600">
                         {job.isVideo ? "VID" : "AUD"}
                       </span>
                       <div className="min-w-0 flex-1">
@@ -747,7 +884,63 @@ export default function TranscriberClient() {
                           {formatFileSize(job.sourceFile.size)}
                           {job.statusMessage ? ` · ${job.statusMessage}` : ""}
                         </p>
+                        {job.error && (
+                          <p
+                            className="mt-1 line-clamp-2 text-xs text-rose-200"
+                            title={job.error}
+                          >
+                            {job.error}
+                          </p>
+                        )}
                       </div>
+                      {jobs.length > 1 && (
+                        <div className="flex shrink-0 flex-col gap-0.5">
+                          <button
+                            type="button"
+                            onClick={() => moveJob(job.id, -1)}
+                            disabled={isRunning || index === 0}
+                            aria-label={`Move ${job.sourceName} up`}
+                            aria-describedby="queue-order-help"
+                            className="grid h-5 w-6 place-items-center rounded text-slate-500 transition-colors hover:bg-white/[0.06] hover:text-slate-200 disabled:cursor-not-allowed disabled:opacity-20"
+                          >
+                            <svg
+                              className="h-3.5 w-3.5"
+                              fill="none"
+                              stroke="currentColor"
+                              viewBox="0 0 24 24"
+                            >
+                              <path
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                strokeWidth={1.8}
+                                d="m6 15 6-6 6 6"
+                              />
+                            </svg>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => moveJob(job.id, 1)}
+                            disabled={isRunning || index === jobs.length - 1}
+                            aria-label={`Move ${job.sourceName} down`}
+                            aria-describedby="queue-order-help"
+                            className="grid h-5 w-6 place-items-center rounded text-slate-500 transition-colors hover:bg-white/[0.06] hover:text-slate-200 disabled:cursor-not-allowed disabled:opacity-20"
+                          >
+                            <svg
+                              className="h-3.5 w-3.5"
+                              fill="none"
+                              stroke="currentColor"
+                              viewBox="0 0 24 24"
+                            >
+                              <path
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                strokeWidth={1.8}
+                                d="m6 9 6 6 6-6"
+                              />
+                            </svg>
+                          </button>
+                        </div>
+                      )}
                       <span
                         className={`shrink-0 rounded-full border px-2.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${statusChipClass(
                           job.status

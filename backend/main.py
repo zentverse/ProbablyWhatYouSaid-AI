@@ -9,8 +9,9 @@ import re
 from collections import Counter
 from uuid import uuid4
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.background import BackgroundTask
 import httpx
 import imageio_ffmpeg
 from dotenv import load_dotenv
@@ -67,6 +68,11 @@ def _get_env_int(name: str, default: int, *, minimum: int = 1) -> int:
 def _safe_remove_file(path: str | None) -> None:
     if path and os.path.exists(path):
         os.remove(path)
+
+
+def _safe_remove_files(*paths: str | None) -> None:
+    for path in paths:
+        _safe_remove_file(path)
 
 
 def _load_job_store() -> dict:
@@ -621,10 +627,17 @@ def _is_openai_language_drift(result: dict, lang: str) -> bool:
     return False
 
 
-async def _save_upload_to_temp(upload: UploadFile) -> tuple[str, int]:
+async def _save_upload_to_temp(
+    upload: UploadFile,
+    *,
+    max_size_bytes: int | None = None,
+    max_size_mb: int | None = None,
+) -> tuple[str, int]:
     suffix = os.path.splitext(upload.filename or "")[1] or ".bin"
     size = 0
     temp_path = None
+    size_limit = max_size_bytes or MAX_UPLOAD_SIZE_BYTES
+    size_limit_mb = max_size_mb or MAX_UPLOAD_SIZE_MB
 
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -634,10 +647,10 @@ async def _save_upload_to_temp(upload: UploadFile) -> tuple[str, int]:
                 if not chunk:
                     break
                 size += len(chunk)
-                if size > MAX_UPLOAD_SIZE_BYTES:
+                if size > size_limit:
                     raise HTTPException(
                         413,
-                        f"Upload too large. Limit is {MAX_UPLOAD_SIZE_MB} MB per file.",
+                        f"Upload too large. Limit is {size_limit_mb} MB per file.",
                     )
                 tmp.write(chunk)
     except Exception:
@@ -647,6 +660,52 @@ async def _save_upload_to_temp(upload: UploadFile) -> tuple[str, int]:
         await upload.close()
 
     return temp_path, size
+
+
+def _converted_mp3_filename(filename: str | None) -> str:
+    source_name = os.path.basename(filename or "video")
+    stem = os.path.splitext(source_name)[0].strip() or "video"
+    return f"{stem}.mp3"
+
+
+async def _convert_video_file_to_mp3(input_path: str, output_path: str) -> None:
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    process = await asyncio.create_subprocess_exec(
+        ffmpeg_exe,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-y",
+        "-i",
+        input_path,
+        "-map",
+        "0:a:0",
+        "-vn",
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        "-b:a",
+        "64k",
+        output_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await process.communicate()
+
+    if process.returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        if len(detail) > 800:
+            detail = detail[-800:]
+        raise HTTPException(
+            422,
+            "FFmpeg could not extract audio from this video. "
+            + (detail or "The file may be damaged, encrypted, or missing an audio track."),
+        )
+
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        raise HTTPException(422, "The video did not contain a usable audio track.")
 
 
 def _count_active_background_jobs() -> int:
@@ -743,24 +802,19 @@ async def _run_transcription_job(job_id: str, provider: str, runner_factory):
     finally:
         _safe_remove_file(temp_path)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=CORS_ALLOWED_ORIGINS
-    or [
-        "http://127.0.0.1:3000",
-        "http://localhost:3000",
-        "http://127.0.0.1:3001",
-        "http://localhost:3001",
-    ],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
 @app.middleware("http")
 async def enforce_upload_limits(request: Request, call_next):
-    if request.method == "POST" and request.url.path == "/transcribe":
+    upload_limits = {
+        "/transcribe": (MAX_UPLOAD_SIZE_BYTES, MAX_UPLOAD_SIZE_MB),
+        "/convert/video-to-mp3": (
+            MAX_VIDEO_UPLOAD_SIZE_BYTES,
+            MAX_VIDEO_UPLOAD_SIZE_MB,
+        ),
+    }
+    upload_limit = upload_limits.get(request.url.path)
+
+    if request.method == "POST" and upload_limit:
+        max_size_bytes, max_size_mb = upload_limit
         content_type = request.headers.get("content-type", "")
         if "multipart/form-data" not in content_type.lower():
             return JSONResponse(
@@ -775,7 +829,7 @@ async def enforce_upload_limits(request: Request, call_next):
                 content={
                     "detail": (
                         "Content-Length is required for uploads and must stay within "
-                        f"the {MAX_UPLOAD_SIZE_MB} MB file limit."
+                        f"the {max_size_mb} MB file limit."
                     )
                 },
             )
@@ -794,15 +848,33 @@ async def enforce_upload_limits(request: Request, call_next):
                 content={"detail": "Content-Length must be greater than zero."},
             )
 
-        if declared_size > MAX_UPLOAD_SIZE_BYTES:
+        # Multipart boundaries and headers add a small amount beyond the file itself.
+        if declared_size > max_size_bytes + MULTIPART_OVERHEAD_ALLOWANCE_BYTES:
             return JSONResponse(
                 status_code=413,
                 content={
-                    "detail": f"Upload too large. Limit is {MAX_UPLOAD_SIZE_MB} MB per file."
+                    "detail": f"Upload too large. Limit is {max_size_mb} MB per file."
                 },
             )
 
     return await call_next(request)
+
+
+# Register CORS after the upload guard so it remains the outer middleware and
+# adds browser-readable headers even when the guard rejects a request early.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ALLOWED_ORIGINS
+    or [
+        "http://127.0.0.1:3000",
+        "http://localhost:3000",
+        "http://127.0.0.1:3001",
+        "http://localhost:3001",
+    ],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ── Azure Speech Services config ──
 AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
@@ -858,6 +930,9 @@ MAX_RETRIES = 3
 RETRY_DELAY = 3
 MAX_UPLOAD_SIZE_MB = _get_env_int("MAX_UPLOAD_SIZE_MB", 256)
 MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
+MAX_VIDEO_UPLOAD_SIZE_MB = _get_env_int("MAX_VIDEO_UPLOAD_SIZE_MB", 8192)
+MAX_VIDEO_UPLOAD_SIZE_BYTES = MAX_VIDEO_UPLOAD_SIZE_MB * 1024 * 1024
+MULTIPART_OVERHEAD_ALLOWANCE_BYTES = 1024 * 1024
 MAX_CONCURRENT_TRANSCRIPTIONS = _get_env_int("MAX_CONCURRENT_TRANSCRIPTIONS", 2)
 MAX_ACTIVE_BACKGROUND_JOBS = _get_env_int("MAX_ACTIVE_BACKGROUND_JOBS", 4)
 SPEECH_CHUNK_SECONDS = 50  # Azure Speech REST limit ~60s
@@ -907,6 +982,43 @@ async def transcribe(
     except Exception:
         _safe_remove_file(temp_path)
         raise
+
+
+@app.post("/convert/video-to-mp3")
+async def convert_video_to_mp3(file: UploadFile = File(...)):
+    extension = os.path.splitext(file.filename or "")[1].lower()
+    if extension not in {".mp4", ".mov"}:
+        await file.close()
+        raise HTTPException(415, "Only MP4 and MOV video files are supported.")
+
+    input_path = None
+    output_path = None
+    try:
+        input_path, file_size = await _save_upload_to_temp(
+            file,
+            max_size_bytes=MAX_VIDEO_UPLOAD_SIZE_BYTES,
+            max_size_mb=MAX_VIDEO_UPLOAD_SIZE_MB,
+        )
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as output_file:
+            output_path = output_file.name
+
+        log_debug(
+            f"DEBUG - native video conversion file={file.filename}, size={file_size}"
+        )
+        await _convert_video_file_to_mp3(input_path, output_path)
+
+        cleanup = BackgroundTask(_safe_remove_files, input_path, output_path)
+        response = FileResponse(
+            output_path,
+            media_type="audio/mpeg",
+            filename=_converted_mp3_filename(file.filename),
+            background=cleanup,
+        )
+        input_path = None
+        output_path = None
+        return response
+    finally:
+        _safe_remove_files(input_path, output_path)
 
 
 @app.get("/transcribe/jobs/{job_id}")

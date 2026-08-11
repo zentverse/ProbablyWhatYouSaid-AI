@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import {
-  convertVideoToMp3,
+  convertVideoToMp3Reliably,
   isSupportedVideoFile,
   type ConvertedMp3Result,
 } from "@/lib/videoToMp3";
@@ -15,12 +15,16 @@ type ConversionItem = {
   status: ItemStatus;
   result?: ConvertedMp3Result;
   downloadUrl?: string;
+  statusMessage?: string;
   error?: string;
 };
 
 type VideoToMp3PanelProps = {
   onMp3Ready: (results: ConvertedMp3Result[]) => void;
 };
+
+const API_BASE_URL =
+  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8100";
 
 function formatFileSize(size: number): string {
   if (size < 1024) {
@@ -83,17 +87,28 @@ export default function VideoToMp3Panel({ onMp3Ready }: VideoToMp3PanelProps) {
     setItems((prev) => [...prev, ...incoming]);
     setIsConverting(true);
 
-    // ffmpeg.wasm is a single shared instance, so convert one at a time.
+    // Browser FFmpeg is a single shared instance, and the native fallback is
+    // intentionally serialized to avoid excessive local disk and CPU use.
     for (const item of incoming) {
       if (item.status === "error") continue;
-      updateItem(item.id, { status: "processing" });
+      updateItem(item.id, { status: "processing", error: undefined });
       try {
-        const result = await convertVideoToMp3(item.file);
+        const result = await convertVideoToMp3Reliably(
+          item.file,
+          API_BASE_URL,
+          (statusMessage) => updateItem(item.id, { statusMessage })
+        );
         const url = URL.createObjectURL(result.blob);
-        updateItem(item.id, { status: "done", result, downloadUrl: url });
+        updateItem(item.id, {
+          status: "done",
+          result,
+          downloadUrl: url,
+          statusMessage: undefined,
+        });
       } catch (conversionError) {
         updateItem(item.id, {
           status: "error",
+          statusMessage: undefined,
           error:
             conversionError instanceof Error
               ? conversionError.message
@@ -146,7 +161,7 @@ export default function VideoToMp3Panel({ onMp3Ready }: VideoToMp3PanelProps) {
           </h2>
         </div>
         <span className="rounded-full border border-white/10 px-3 py-1 text-[11px] text-slate-400">
-          Browser-side
+          Browser + native
         </span>
       </div>
 
@@ -193,7 +208,7 @@ export default function VideoToMp3Panel({ onMp3Ready }: VideoToMp3PanelProps) {
                 : "Choose video files"}
             </p>
             <p className="mt-1 text-sm text-slate-400">
-              MP4 and MOV — pick one or many, converted in your browser
+              MP4 and MOV — large files automatically use native conversion
             </p>
           </div>
         </div>
@@ -226,8 +241,16 @@ export default function VideoToMp3Panel({ onMp3Ready }: VideoToMp3PanelProps) {
                   </p>
                   <p className="truncate text-xs text-slate-500">
                     {formatFileSize(item.file.size)}
-                    {item.error ? ` · ${item.error}` : ""}
+                    {item.statusMessage ? ` · ${item.statusMessage}` : ""}
                   </p>
+                  {item.error && (
+                    <p
+                      className="mt-1 line-clamp-2 text-xs text-rose-200"
+                      title={item.error}
+                    >
+                      {item.error}
+                    </p>
+                  )}
                 </div>
                 {item.status === "done" && item.downloadUrl && item.result && (
                   <a
@@ -260,8 +283,8 @@ export default function VideoToMp3Panel({ onMp3Ready }: VideoToMp3PanelProps) {
       <div className="mt-6 space-y-4">
         {isConverting && (
           <div className="rounded-2xl border border-cyan-300/20 bg-cyan-400/8 px-4 py-3 text-sm leading-7 text-cyan-50">
-            Converting in the browser. Larger videos take a little longer, and
-            files convert one at a time.
+            Converting one file at a time. Large files use the local native
+            service to avoid browser memory limits.
           </div>
         )}
 

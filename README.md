@@ -1,6 +1,6 @@
 # ProbablyWhatYouSaid AI
 
-ProbablyWhatYouSaid AI is a split frontend/backend workspace for audio transcription and browser-side video conversion.
+ProbablyWhatYouSaid AI is a split frontend/backend workspace for audio transcription and hybrid browser/native video conversion.
 
 The app lets you:
 
@@ -8,7 +8,7 @@ The app lets you:
 - review speaker-grouped output and the full transcript side by side
 - copy the final transcript to the clipboard from the results panel
 - extract only the English passages from a mixed-language recording with the **English only** toggle
-- upload an MP4 or MOV file, convert it to MP3 in the browser, and send that MP3 straight into the transcription flow
+- upload an MP4 or MOV file, convert it to MP3, and send that MP3 straight into the transcription flow
 
 ## Workspace layout
 
@@ -56,6 +56,7 @@ copy .env.example .env
 Optional hardening knobs in `backend/.env`:
 
 - `MAX_UPLOAD_SIZE_MB=256` limits how much data one upload can send while still allowing long-form recordings to use the background queue.
+- `MAX_VIDEO_UPLOAD_SIZE_MB=8192` limits original MP4/MOV uploads handled by the native FFmpeg fallback. Keep enough free temporary-disk space for roughly twice the largest input video.
 - `MAX_CONCURRENT_TRANSCRIPTIONS=2` caps simultaneous provider work.
 - `MAX_ACTIVE_BACKGROUND_JOBS=4` rejects new large uploads when the queue is already busy.
 
@@ -101,7 +102,7 @@ English, that text is genuine English and cannot be filtered out.
 
 1. Switch to `Video to MP3`.
 2. Upload an MP4 or MOV file.
-3. Wait for ffmpeg.wasm to generate the MP3 in the browser.
+3. Wait for MP3 conversion. Files up to 512 MB use ffmpeg.wasm in the browser; larger files use native FFmpeg through the local backend. Browser failures automatically retry through the native path.
 4. The generated MP3 is automatically selected back in `Transcribe`.
 5. Download the MP3 or transcribe it immediately.
 
@@ -134,7 +135,7 @@ recordings stay under `MAX_UPLOAD_SIZE_MB`.
 - GPT-4o transcripts are cleaned automatically: repeated tokens, phrases, and multi-sentence
   loops are collapsed, and stray instruction text the model sometimes echoes into its output
   is stripped.
-- Browser-side video conversion loads FFmpeg from jsDelivr on first use.
+- Browser-side video conversion loads FFmpeg from jsDelivr on first use. Large files bypass WebAssembly memory limits through the backend's bundled native FFmpeg binary.
 - If frontend and backend run on different origins, update `CORS_ALLOWED_ORIGINS` in `backend/.env`.
 
 ## Repo hygiene
